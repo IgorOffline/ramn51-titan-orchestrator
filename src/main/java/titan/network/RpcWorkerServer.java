@@ -61,6 +61,19 @@ public class RpcWorkerServer {
      * {@code start()}, so a killed worker kept announcing itself every 30 seconds with a closed
      * server socket — the Master re-admitted it, dispatched to it, and got no reply.
      */
+    /** Consecutive failed re-registrations. Reset the moment the Master answers again. */
+    private final java.util.concurrent.atomic.AtomicInteger regFailures =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * How many consecutive failed re-registrations an EPHEMERAL worker tolerates before exiting.
+     * At the 30s re-register interval the default is ten minutes of no Master, which is long
+     * enough to ride out a restart and short enough that a dead Master does not leave orphans.
+     * Permanent workers ignore this and retry indefinitely.
+     */
+    private static final int MAX_REG_FAILURES =
+            Math.max(1, titan.TitanConfig.getInt("titan.worker.registration.max.failures", 20));
+
     private ScheduledExecutorService reRegisterExecutor;
 
     /**
@@ -91,7 +104,20 @@ public class RpcWorkerServer {
     /**
      * The maximum number of concurrent tasks that this worker can execute simultaneously in its worker pool.
      */
-    private static final int MAX_THREADS = 4;
+    /**
+     * Concurrent job slots on this worker.
+     *
+     * A slot backs an OS process, not a thread, so the real ceiling is host RAM and CPU rather
+     * than anything in the JVM. Default stays at the historical 4 so existing deployments do not
+     * change behaviour; set titan.worker.slots (or TITAN_WORKER_SLOTS) to size it for the host.
+     * Env is the right channel because several workers with different roles can share one machine,
+     * and a shared properties file would give them all the same number.
+     *
+     * Clamped rather than trusted: a fat-fingered value should fail visibly at startup instead of
+     * as an out-of-memory storm halfway through a DAG.
+     */
+    private static final int MAX_THREADS = Math.max(1,
+            Math.min(titan.TitanConfig.getInt("titan.worker.slots", 4), 64));
 
     /**
      * A fixed-size thread pool dedicated to executing actual tasks (jobs). This limits the concurrent workload on the worker.
@@ -174,6 +200,10 @@ public class RpcWorkerServer {
     public void start() throws Exception {
         System.out.println("DEBUG: Attempting to bind to port: " + this.port);
         System.out.println("---- Worker Startup Check ----");
+        // Every worker journals its child PIDs, ephemeral ones included: a worker that is killed
+        // without warning cannot clean up after itself, so the record has to already be on disk.
+        // Rows are owned by port, so this only ever reaps what a previous worker HERE left behind.
+        titan.tasks.ProcessRegistry.init(this.port);
         titan.tasks.ProcessRegistry.loadAndCleanUpProcesses();
 
         try(ServerSocket serverSocket = new ServerSocket(port)){
@@ -188,8 +218,39 @@ public class RpcWorkerServer {
             });
             reRegisterExecutor.scheduleAtFixedRate(() -> {
                 if (!isRunning) return;              // shutting down: stop announcing ourselves
-                try { registerWithScheduler(); }
-                catch (Exception e) { System.err.println("[WARN] Re-registration failed: " + e.getMessage()); }
+                boolean ok;
+                try { ok = registerWithScheduler(); }
+                catch (Exception e) { ok = false; }
+                if (ok) {
+                    regFailures.set(0);              // Master reachable again; forget the streak
+                } else {
+                    int n = regFailures.incrementAndGet();
+                    System.err.println("[WARN] Re-registration failed (" + n + "/" + MAX_REG_FAILURES + ")");
+
+                    // An EPHEMERAL worker exists only to serve the Master that spawned it. If that
+                    // Master is gone for good, nothing will ever reap this process: it is
+                    // re-parented to init and retries forever. Six such orphans were found on one
+                    // machine, the oldest 27 hours old, three of them fighting over the same port.
+                    //
+                    // A PERMANENT worker is deliberately deployed by an operator and must survive a
+                    // Master restart, so it keeps retrying however long that takes.
+                    if (!isPermanent && n >= MAX_REG_FAILURES) {
+                        System.err.println("[FATAL] No Master for ~" + (n * 30) + "s. "
+                                + "Ephemeral worker on port " + port + " is exiting rather than "
+                                + "lingering as an orphan.");
+                        isRunning = false;
+                        try {
+                            int killed = titan.tasks.ScriptExecutorHandler.killAll();
+                            // Services too. An ephemeral worker journals nothing, so if it does not
+                            // reap its own services here nothing ever will: they outlive it as
+                            // orphans with no record anywhere that they exist.
+                            int svcs = titan.tasks.ProcessRegistry.killAllRegistered();
+                            if (killed + svcs > 0) System.err.println("[FATAL] Killed " + killed
+                                    + " job(s) and " + svcs + " service(s); no Master to report to anyway.");
+                        } catch (Exception ignored) { }
+                        System.exit(0);
+                    }
+                }
             }, 30, 30, TimeUnit.SECONDS);
 
             while(this.isRunning){
@@ -207,7 +268,7 @@ public class RpcWorkerServer {
      *
      * @throws Exception If an I/O error occurs during communication with the scheduler or if registration fails.
      */
-    private void registerWithScheduler() throws Exception {
+    private boolean registerWithScheduler() throws Exception {
         try(Socket socket = new Socket(schedulerHost, schedulerPort);
             DataInputStream in = new DataInputStream(socket.getInputStream());
             DataOutputStream out = new DataOutputStream(socket.getOutputStream())){
@@ -220,8 +281,13 @@ public class RpcWorkerServer {
                 System.err.println("[FAIL] Registration failed: " + responsePacket.payload);
             }
         }catch (IOException e){
-            e.printStackTrace();
+            // Reported, not thrown: startup calls this before the Master may exist, and the
+            // periodic caller needs a value it can count rather than an exception it must catch.
+            System.err.println("[WARN] Could not reach Master at " + schedulerHost + ":"
+                    + schedulerPort + " - " + e.getMessage());
+            return false;
         }
+        return true;
     }
 
     /**
@@ -243,7 +309,11 @@ public class RpcWorkerServer {
                     if (packet.opCode == TitanProtocol.OP_HEARTBEAT) {
 
                         int activeThreads = 0;
-                        int maxThreads = 4;
+                        // MUST be the same source as the pool above. These were two independent
+                        // literals that happened to agree; changing only one would have the worker
+                        // run N jobs while telling the Master it can hold 4, so saturation,
+                        // scaling and admission would all size against a fiction.
+                        int maxThreads = MAX_THREADS;
 
                         if(this.workerPool !=null){
                             if (this.workerPool instanceof java.util.concurrent.ThreadPoolExecutor) {
@@ -770,8 +840,7 @@ public class RpcWorkerServer {
         System.out.println("Capability: " + capability);
         System.out.println("Mode:             " + (isPermanent ? "PERMANENT (Protected)" : "EPHEMERAL (Auto-Scaleable)"));
 
-        titan.tasks.ProcessRegistry.loadAndCleanUpProcesses();
-
+        // Cleanup happens in start(), once the registry knows which port owns its rows.
         RpcWorkerServer rpcWorkerServer = new RpcWorkerServer(myPort, schedHost, schedPort, capability, isPermanent);
         rpcWorkerServer.start();
     }

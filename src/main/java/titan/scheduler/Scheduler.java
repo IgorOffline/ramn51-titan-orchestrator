@@ -469,6 +469,10 @@ import titan.storage.TitanJRedisAdapter;
     private long lastCompletedMark = 0, lastFailedMark = 0;
 
     /** Records a scaler decision so it can be drawn as a marker on the metric charts. */
+    /** Set titan.scheduler.autoscale=false to hold the fleet at whatever is registered. */
+    private static final boolean AUTOSCALE_ENABLED =
+            !"false".equalsIgnoreCase(TitanConfig.get("titan.scheduler.autoscale", "true"));
+
     private void recordScalerEvent(String type, String detail) {
         if ("SCALE_UP".equals(type)) scaleUpCount.incrementAndGet();
         if ("DESCALE".equals(type)) descaleCount.incrementAndGet();
@@ -837,7 +841,12 @@ import titan.storage.TitanJRedisAdapter;
             int totalAvailableSlots = allWorkers.stream().mapToInt(Worker::getMaxCap).sum();;
             System.out.println("[SCALER] Cluster Pressure: " + totalUsedSlots + "/" + totalAvailableSlots);
 
-            if (hasDemand && generalPoolSaturated && totalCount < MAX_WORKERS){
+            // Pinning the fleet matters for measurement: with the scaler live, a "2 worker" run
+            // becomes a 5 worker run the moment demand appears, and any slots-vs-workers
+            // experiment measures the scaler instead of the variable under test.
+            if (!AUTOSCALE_ENABLED) {
+                // deliberately held: the operator asked for a fixed fleet
+            } else if (hasDemand && generalPoolSaturated && totalCount < MAX_WORKERS){
                scalingInProgress = true;
                recordScalerEvent("SCALE_UP", queuedDemand + " job(s) queued, all "
                        + Math.max(generalWorkers.size(), 0) + " GENERAL worker(s) saturated");

@@ -48,13 +48,55 @@ import titan.network.LogBatcher;
             new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
+     * Kills a process and everything it spawned.
+     *
+     * destroyForcibly() only signals the direct child. A task that starts its own subprocesses
+     * leaves them running when it dies, and they are then re-parented to init where nothing owns
+     * them: the slot is freed while the work continues, so the fleet's real load no longer matches
+     * what the Master believes. Measured directly: a cancelled job's grandchild was still alive
+     * four seconds later.
+     *
+     * Descendants are killed BEFORE the parent. Killing the parent first re-parents its children
+     * immediately, and the handle needed to find them is gone.
+     */
+    private static void killTree(Process p) {
+        if (p == null) return;
+        try {
+            p.toHandle().descendants().forEach(ProcessHandle::destroyForcibly);
+        } catch (Exception ignored) {
+            // descendants() is best-effort; never let cleanup failure mask the kill below
+        }
+        p.destroyForcibly();
+    }
+
+    /**
+     * Kills every task still running on this worker, process trees included.
+     *
+     * Called when a worker is about to exit on its own. Leaving the task processes behind would
+     * recreate exactly the orphan problem the exit is meant to avoid: they would be re-parented to
+     * init with no worker and no Master aware of them.
+     *
+     * @return how many jobs were killed.
+     */
+    public static int killAll() {
+        int n = 0;
+        for (java.util.Map.Entry<String, Process> e : activeProcesses.entrySet()) {
+            killTree(e.getValue());
+            System.out.println("[SHUTDOWN] Killed process tree for job: " + e.getKey());
+            n++;
+        }
+        activeProcesses.clear();
+        return n;
+    }
+
+    /**
      * Forcibly terminates the process associated with the given job ID.
      * @return {@code true} if a process was found and destroyed, {@code false} if not found.
      */
     public static boolean killJob(String jobId) {
         Process p = activeProcesses.get(jobId);
         if (p != null) {
-            p.destroyForcibly();
+            killTree(p);
             System.out.println("[CANCEL] Killed process for job: " + jobId);
             return true;
         }
@@ -268,7 +310,9 @@ import titan.network.LogBatcher;
             streamer.join(); // this ensures we capture the last line of the o/p.
 
             if (!finished) {
-                process.destroy();
+                // destroy() is SIGTERM to the direct child only, so a script that ignores SIGTERM
+                // survived its own timeout and kept its slot. Kill the tree, forcibly.
+                killTree(process);
                 return "ERROR: Script timed out (" + timeoutSeconds + "s limit)";
             }
 
